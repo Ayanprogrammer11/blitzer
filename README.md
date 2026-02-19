@@ -1,6 +1,6 @@
 # blitzer
 
-`blitzer` is a Rust CLI downloader that uses multiple HTTP range requests in parallel to maximize throughput.
+`blitzer` is a Rust terminal app (TUI) for high-throughput downloads using parallel HTTP range requests.
 
 ## Features
 
@@ -8,7 +8,8 @@
 - Automatic fallback to single-stream mode when range requests are unsupported
 - Resume support via part files
 - Per-chunk retry with exponential backoff
-- Progress bar and transfer speed output
+- Full-screen interactive TUI (no startup flags required)
+- Live in-app progress with throughput and mode details
 
 ## Build
 
@@ -19,26 +20,30 @@ cargo build --release
 ## Usage
 
 ```bash
-# Basic usage (auto output name)
-./target/release/blitzer "https://example.com/file.iso"
-
-# Save to specific output path
-./target/release/blitzer "https://example.com/file.iso" -o ./downloads/file.iso
-
-# Increase parallelism
-./target/release/blitzer "https://example.com/file.iso" -n 16
-
-# Disable resume behavior
-./target/release/blitzer "https://example.com/file.iso" --no-resume
+./target/release/blitzer
 ```
 
-## CLI options
+You will get an interactive form for:
 
-- `-o, --output <PATH>`: Output file path
-- `-n, --connections <N>`: Number of parallel connections (`1..=64`)
-- `--retries <N>`: Retry attempts per chunk (`<=20`)
-- `--timeout-secs <N>`: Request timeout in seconds (`5..=300`)
-- `--no-resume`: Ignore existing part files and restart from scratch
+- URL
+- Output path (optional)
+- Connections (`1..=64`)
+- Retries (`<=20`)
+- Timeout seconds (`5..=300`)
+- Resume toggle
+
+## TUI controls
+
+- `Tab` / `Shift+Tab`: Move between fields
+- `Left click`: Focus a field, place cursor in text inputs, toggle resume checkbox
+- `Left` / `Right` / `Home` / `End`: Move cursor within current input field
+- `Backspace` / `Delete`: Remove text around cursor in current input field
+- `Enter`: Start download (or return from done/error screen)
+- `Space`: Toggle resume mode when resume field is focused
+- `c`: Cancel an active download
+- `q`: Quit from result/download screens
+- `Esc`: Quit from form/result screens
+- `Ctrl+C`: Quit immediately
 
 ## Notes
 
