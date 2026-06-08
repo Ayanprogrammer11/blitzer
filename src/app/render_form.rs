@@ -31,6 +31,7 @@ impl App {
                 label: "URL",
                 value: &self.form.url,
                 focused: self.form.focused_field() == FormField::Url,
+                invalid: self.form.invalid_field == Some(FormField::Url),
                 cursor_char_pos: self.form.focused_cursor(),
                 placeholder: "https://example.com/file.iso",
                 editable: true,
@@ -42,9 +43,10 @@ impl App {
             frame,
             chunks[2],
             TextField {
-                label: "Output Path (optional)",
+                label: "Output",
                 value: &self.form.output,
                 focused: self.form.focused_field() == FormField::Output,
+                invalid: self.form.invalid_field == Some(FormField::Output),
                 cursor_char_pos: self.form.focused_cursor(),
                 placeholder: "./downloads/file.iso",
                 editable: true,
@@ -56,9 +58,10 @@ impl App {
             frame,
             chunks[3],
             TextField {
-                label: "Connections",
+                label: "Connections (auto or 1-64)",
                 value: &self.form.connections,
                 focused: self.form.focused_field() == FormField::Connections,
+                invalid: self.form.invalid_field == Some(FormField::Connections),
                 cursor_char_pos: self.form.focused_cursor(),
                 placeholder: "auto",
                 editable: true,
@@ -70,9 +73,10 @@ impl App {
             frame,
             chunks[4],
             TextField {
-                label: "Retries",
+                label: "Retries (0-20)",
                 value: &self.form.retries,
                 focused: self.form.focused_field() == FormField::Retries,
+                invalid: self.form.invalid_field == Some(FormField::Retries),
                 cursor_char_pos: self.form.focused_cursor(),
                 placeholder: "4",
                 editable: true,
@@ -84,9 +88,10 @@ impl App {
             frame,
             chunks[5],
             TextField {
-                label: "Timeout (seconds)",
+                label: "Timeout (5-300s)",
                 value: &self.form.timeout_secs,
                 focused: self.form.focused_field() == FormField::Timeout,
+                invalid: self.form.invalid_field == Some(FormField::Timeout),
                 cursor_char_pos: self.form.focused_cursor(),
                 placeholder: "30",
                 editable: true,
@@ -114,9 +119,10 @@ fn render_resume_field(frame: &mut ratatui::Frame<'_>, area: Rect, form: &FormSt
         frame,
         area,
         TextField {
-            label: "Resume Mode (press Space to toggle)",
+            label: "Resume",
             value: resume_value,
             focused: form.focused_field() == FormField::Resume,
+            invalid: false,
             cursor_char_pos: None,
             placeholder: "",
             editable: false,
@@ -125,9 +131,10 @@ fn render_resume_field(frame: &mut ratatui::Frame<'_>, area: Rect, form: &FormSt
 }
 
 fn render_form_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
-    let help = Paragraph::new(
-        "Enter: start  Tab/Shift+Tab: move fields  Left/Right/Home/End: move cursor  Click: focus/caret  Esc: quit",
-    )
+    let help = Paragraph::new(vec![
+        ratatui::text::Line::from("Enter start | Tab move | Arrows/Home/End edit | Ctrl+U clear"),
+        ratatui::text::Line::from("Esc quit | Click focuses fields | Space toggles resume"),
+    ])
     .style(Style::default().fg(Color::DarkGray))
     .alignment(Alignment::Left);
     frame.render_widget(help, area);

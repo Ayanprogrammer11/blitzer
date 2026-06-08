@@ -39,7 +39,7 @@ For automated downloads:
 ./target/release/blitzer "https://example.com/file.iso" --output ./downloads/file.iso --connections auto
 ```
 
-CLI options: `--connections auto|N`, `--retries N`, `--timeout SECONDS`, and `--no-resume`.
+CLI options: `--connections auto|N`, `--retries N`, `--timeout SECONDS`, `--no-resume`, `--no-range-strategy single|overlap`, `--no-range-workers N`, and `--overlap-bytes N`.
 
 No-range servers default to the speculative overlap strategy:
 
@@ -55,18 +55,18 @@ Use `--no-range-strategy single` to force the conservative single-stream fallbac
 - `Left click`: Focus a field, place cursor in text inputs, toggle resume checkbox
 - `Left` / `Right` / `Home` / `End`: Move cursor within current input field
 - `Backspace` / `Delete`: Remove text around cursor in current input field
+- `Ctrl+U`: Clear the focused input field
 - `Enter`: Start download (or return from done/error screen)
 - `Space`: Toggle resume mode when resume field is focused
-- `c`: Cancel an active download
-- `q`: Quit from result/download screens
-- `Esc`: Quit from form/result screens
-- `Ctrl+C`: Quit immediately
+- `c` / `Esc`: Cancel an active download and keep the result on screen
+- `q` / `Ctrl+C`: Cancel an active download, save verified resume data, then quit
+- `q` / `Esc`: Quit from result screens
 
 ## Notes
 
 - Best performance still comes from servers that support byte-range requests.
-- When a server does not support `Range` requests, Blitzer can start multiple ordinary streams, skip forward inside each stream, and verify overlapping bytes before merging. This also works when the server does not publish `Content-Length`; if the overlap proof fails because the source is dynamic or unstable, Blitzer falls back to a single stream.
-- If a server advertises ranges but rate-limits parallel chunks, Blitzer retries with one range worker instead of switching to multi-stream no-range mode.
+- When a server does not support `Range` requests, Blitzer can start ordinary streams, skip forward inside each stream, and verify overlapping bytes before merging. For unknown-size responses it first checks whether the body fits in the initial payload window before starting extra streams; if the overlap proof fails because the source is dynamic or unstable, Blitzer falls back to a single stream.
+- If a server rejects high range concurrency, Blitzer preserves verified parts and retries with four workers, then one worker if needed, instead of switching to multi-stream no-range mode.
 - Some download pages gate the real file behind browser-style navigation. When a redirected HTML page exposes a referer-gated attachment, Blitzer reprobes the original URL with the discovered referer and downloads the actual file.
 - Resume data is tied to the URL, content validators, total size, and chunk layout. Stale or legacy part files are discarded instead of being merged into a corrupted output.
 - `auto` selects a worker count from file size and available CPU, then splits the file into more segments than workers so fast lanes keep pulling work while slower ranges do not hold the whole download hostage.

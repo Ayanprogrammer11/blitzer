@@ -44,6 +44,28 @@ pub(super) async fn fetch_segments(plan: FetchPlan) -> Result<Vec<SegmentMeta>> 
         .total_size
         .map(|size| segment_count(size, plan.payload_bytes));
 
+    if known_segments.is_none() {
+        let first = fetch_segment(SegmentJob {
+            client: plan.client.clone(),
+            url: plan.url.clone(),
+            request_headers: plan.request_headers.clone(),
+            part_dir: plan.part_dir.clone(),
+            index: 0,
+            payload_bytes: plan.payload_bytes,
+            overlap_bytes: plan.overlap_bytes,
+            retries: plan.retries,
+            cancel: plan.cancel.clone(),
+            tx: plan.tx.clone(),
+        })
+        .await?;
+        let saw_eof = first.eof;
+        metas.push(first);
+        if saw_eof {
+            return Ok(metas);
+        }
+        next_index = 1;
+    }
+
     loop {
         let remaining = known_segments
             .map(|segments| segments.saturating_sub(next_index))
@@ -168,9 +190,16 @@ async fn fetch_segment_once(job: &SegmentJob) -> Result<SegmentMeta> {
             out.write_all(&slice[..keep])
                 .await
                 .with_context(|| format!("failed writing {}", path.display()))?;
+            let before = captured;
             captured += keep as u64;
             capture_remaining -= keep as u64;
-            let _ = job.tx.send(DownloadEvent::Advanced(keep as u64));
+            let useful_from = if job.index == 0 { 0 } else { job.overlap_bytes };
+            let useful_before = before.saturating_sub(useful_from);
+            let useful_after = captured.saturating_sub(useful_from);
+            let useful = useful_after.saturating_sub(useful_before);
+            if useful > 0 {
+                let _ = job.tx.send(DownloadEvent::Advanced(useful));
+            }
         }
         if capture_remaining == 0 {
             out.flush()

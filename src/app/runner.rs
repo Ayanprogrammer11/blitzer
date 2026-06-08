@@ -69,11 +69,23 @@ pub async fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Resul
                         app.mark_cancelled(0);
                     }
                 }
-                AppAction::Quit => {
-                    if let Some(active) = active_download.take() {
-                        active.handle.abort();
+                AppAction::CancelAndQuit => {
+                    app.quit_after_download = true;
+                    if let Some(active) = active_download.as_ref() {
+                        active.cancel.cancel();
+                        app.mark_cancelling();
+                    } else {
+                        app.should_quit = true;
                     }
-                    app.should_quit = true;
+                }
+                AppAction::Quit => {
+                    if let Some(active) = active_download.as_ref() {
+                        app.quit_after_download = true;
+                        active.cancel.cancel();
+                        app.mark_cancelling();
+                    } else {
+                        app.should_quit = true;
+                    }
                 }
             }
         }

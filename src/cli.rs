@@ -1,16 +1,15 @@
 use crate::{
     config::{
-        DownloadConfig, MAX_RETRIES, MAX_TIMEOUT, MIN_TIMEOUT, default_connection_input,
-        default_no_range_workers, default_overlap_bytes, parse_connection_strategy,
-        parse_no_range_strategy,
+        DownloadConfig, default_connection_input, default_no_range_workers, default_overlap_bytes,
+        parse_connection_strategy, parse_http_url, parse_no_range_strategy, parse_output_path,
+        parse_retries, parse_timeout_secs,
     },
-    download::{DownloadEvent, run_download},
+    download::{CancelToken, DownloadEvent, run_download_with_cancel},
+    format::{format_bytes, format_rate},
 };
 use anyhow::{Context, Result, bail};
-use indicatif::HumanBytes;
-use std::{env, path::PathBuf};
+use std::env;
 use tokio::sync::mpsc;
-use url::Url;
 
 pub async fn run_from_args() -> Result<bool> {
     let mut args = env::args().skip(1).peekable();
@@ -19,7 +18,7 @@ pub async fn run_from_args() -> Result<bool> {
     }
 
     let mut url = None;
-    let mut output = None;
+    let mut output = None::<String>;
     let mut connections = default_connection_input();
     let mut retries = 4usize;
     let mut timeout_secs = 30u64;
@@ -35,7 +34,7 @@ pub async fn run_from_args() -> Result<bool> {
                 return Ok(true);
             }
             "-o" | "--output" => {
-                output = Some(PathBuf::from(next_value(&mut args, &arg)?));
+                output = Some(next_value(&mut args, &arg)?);
             }
             "-c" | "--connections" => {
                 connections = next_value(&mut args, &arg)?;
@@ -73,20 +72,13 @@ pub async fn run_from_args() -> Result<bool> {
         }
     }
 
-    if retries > MAX_RETRIES {
-        bail!("Retries must be <= {MAX_RETRIES}");
-    }
-    if !(MIN_TIMEOUT..=MAX_TIMEOUT).contains(&timeout_secs) {
-        bail!("Timeout must be in range {MIN_TIMEOUT}..={MAX_TIMEOUT} seconds");
-    }
-
-    let url = Url::parse(url.as_deref().context("Missing URL")?).context("URL is invalid")?;
+    let url = parse_http_url(url.as_deref().context("Missing URL")?)?;
     let cfg = DownloadConfig {
         url,
-        output,
+        output: parse_output_path(output.as_deref().unwrap_or_default())?,
         connections: parse_connection_strategy(&connections)?,
-        retries,
-        timeout_secs,
+        retries: parse_retries(&retries.to_string())?,
+        timeout_secs: parse_timeout_secs(&timeout_secs.to_string())?,
         no_resume,
         no_range_strategy: parse_no_range_strategy(
             &no_range_strategy,
@@ -101,14 +93,31 @@ pub async fn run_from_args() -> Result<bool> {
 
 async fn run_cli_download(cfg: DownloadConfig) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<DownloadEvent>();
+    let cancel = CancelToken::default();
+    let task_cancel = cancel.clone();
     let handle = tokio::spawn(async move {
-        if let Err(err) = run_download(cfg, tx.clone()).await {
+        if let Err(err) = run_download_with_cancel(cfg, tx.clone(), task_cancel).await {
             let _ = tx.send(DownloadEvent::Failed(format!("{err:#}")));
         }
     });
 
     let mut downloaded = 0u64;
-    while let Some(evt) = rx.recv().await {
+    let mut cancelling = false;
+    loop {
+        let evt = tokio::select! {
+            evt = rx.recv() => evt,
+            signal = tokio::signal::ctrl_c(), if !cancelling => {
+                signal.context("failed listening for Ctrl+C")?;
+                cancelling = true;
+                cancel.cancel();
+                eprintln!("Interrupt received; cancelling and saving verified resume data...");
+                continue;
+            }
+        };
+        let Some(evt) = evt else {
+            break;
+        };
+
         match evt {
             DownloadEvent::Phase(message) => eprintln!("{message}"),
             DownloadEvent::TargetResolved {
@@ -120,15 +129,14 @@ async fn run_cli_download(cfg: DownloadConfig) -> Result<()> {
                     "Output: {} | Size: {} | Ranges: {}",
                     output.display(),
                     total_size
-                        .map(HumanBytes)
-                        .map(|v| v.to_string())
+                        .map(format_bytes)
                         .unwrap_or_else(|| "unknown".to_string()),
                     supports_ranges
                 );
             }
             DownloadEvent::ResumeOffset(bytes) => {
                 downloaded = bytes;
-                eprintln!("Resumed {}", HumanBytes(downloaded));
+                eprintln!("Resumed {}", format_bytes(downloaded));
             }
             DownloadEvent::PlanSelected {
                 strategy,
@@ -136,20 +144,30 @@ async fn run_cli_download(cfg: DownloadConfig) -> Result<()> {
                 segments,
                 segment_size,
             } => {
+                let segments = if segments == 0 {
+                    "unknown".to_string()
+                } else {
+                    segments.to_string()
+                };
                 eprintln!(
                     "Plan: {strategy} | workers={workers} | segments={segments} | segment~{}",
-                    HumanBytes(segment_size)
+                    format_bytes(segment_size)
                 );
+            }
+            DownloadEvent::ProgressReset => {
+                downloaded = 0;
             }
             DownloadEvent::Advanced(bytes) => {
                 downloaded = downloaded.saturating_add(bytes);
             }
             DownloadEvent::Completed(summary) => {
                 eprintln!(
-                    "Done: {} ({} new, {:.2} MiB/s avg)",
+                    "Done: {} ({} new, {} avg)",
                     summary.output.display(),
-                    HumanBytes(summary.newly_transferred),
-                    summary.avg_mib_per_sec
+                    format_bytes(summary.newly_transferred),
+                    format_rate(
+                        summary.newly_transferred as f64 / summary.elapsed.as_secs_f64().max(0.001)
+                    )
                 );
                 handle.await.context("download task failed")?;
                 return Ok(());
@@ -157,7 +175,7 @@ async fn run_cli_download(cfg: DownloadConfig) -> Result<()> {
             DownloadEvent::Cancelled { saved_bytes } => {
                 eprintln!(
                     "Cancelled. Saved {} verified bytes for resume.",
-                    HumanBytes(saved_bytes)
+                    format_bytes(saved_bytes)
                 );
                 handle.await.context("download task failed")?;
                 return Ok(());

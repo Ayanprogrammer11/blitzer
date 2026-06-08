@@ -80,16 +80,9 @@ impl RangeDownloadError {
     fn status(status: StatusCode, retry_after: Option<Duration>) -> Self {
         Self {
             kind: RangeDownloadErrorKind::Status(status),
-            message: format!("server does not honor range requests (status {status})"),
+            message: format!("range request was rejected with status {status}"),
             retry_after,
         }
-    }
-
-    pub(super) fn is_rate_limited(&self) -> bool {
-        matches!(
-            self.kind,
-            RangeDownloadErrorKind::Status(StatusCode::TOO_MANY_REQUESTS)
-        )
     }
 
     pub(super) fn can_retry_without_ranges(&self) -> bool {
@@ -103,6 +96,13 @@ impl RangeDownloadError {
 
     pub(super) fn retry_after(&self) -> Option<Duration> {
         self.retry_after
+    }
+
+    pub(super) fn status_code(&self) -> Option<StatusCode> {
+        match self.kind {
+            RangeDownloadErrorKind::Status(status) => Some(status),
+            _ => None,
+        }
     }
 }
 

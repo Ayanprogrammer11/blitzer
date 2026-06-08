@@ -6,7 +6,7 @@ use super::{
     manifest::{Chunk, ResumeManifest, build_chunks, chunk_len},
     parts::{
         compute_resume_offset, merge_parts, part_dir_for, part_path_for, prepare_part_dir,
-        remove_file_if_exists, replace_output,
+        remove_file_if_exists, remove_state_dir_if_exists, replace_output,
     },
     tuning::plan_transfer,
 };
@@ -216,9 +216,7 @@ pub(super) async fn download_parallel(plan: ParallelDownload<'_>) -> Result<u64>
     }
 
     merge_parts(&part_dir, output, &chunks, total_size).await?;
-    fs::remove_dir_all(&part_dir)
-        .await
-        .with_context(|| format!("failed to cleanup {}", part_dir.display()))?;
+    remove_state_dir_if_exists(&part_dir).await?;
 
     Ok(transferred.load(Ordering::Relaxed))
 }

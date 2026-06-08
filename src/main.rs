@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod config;
 mod download;
+mod format;
 mod terminal;
 
 use anyhow::Result;

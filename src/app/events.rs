@@ -3,9 +3,8 @@ use super::{
     form::FormField,
     render::{form_chunks, point_in_rect},
 };
-use crate::download::DownloadEvent;
+use crate::{download::DownloadEvent, format::format_bytes};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use indicatif::HumanBytes;
 use ratatui::layout::Rect;
 
 impl App {
@@ -15,8 +14,12 @@ impl App {
 
     pub(super) fn on_key(&mut self, key: KeyEvent) -> AppAction {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
-            return AppAction::Quit;
+            return if self.mode == UiMode::Downloading {
+                AppAction::CancelAndQuit
+            } else {
+                self.should_quit = true;
+                AppAction::Quit
+            };
         }
 
         match self.mode {
@@ -62,6 +65,9 @@ impl App {
                 continue;
             }
 
+            if field != self.form.focused_field() && !self.form.validate_focused() {
+                return AppAction::None;
+            }
             self.form.set_focus_field(field);
             if field == FormField::Resume {
                 self.toggle_resume();
@@ -90,13 +96,17 @@ impl App {
                 AppAction::Quit
             }
             KeyCode::Tab | KeyCode::Down => {
-                self.form.next_field();
-                self.form.clear_message();
+                if self.form.validate_focused() {
+                    self.form.next_field();
+                    self.form.clear_message();
+                }
                 AppAction::None
             }
             KeyCode::BackTab | KeyCode::Up => {
-                self.form.prev_field();
-                self.form.clear_message();
+                if self.form.validate_focused() {
+                    self.form.prev_field();
+                    self.form.clear_message();
+                }
                 AppAction::None
             }
             KeyCode::Backspace => {
@@ -106,6 +116,11 @@ impl App {
             }
             KeyCode::Delete => {
                 self.form.delete();
+                self.form.clear_message();
+                AppAction::None
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.form.clear_focused_input();
                 self.form.clear_message();
                 AppAction::None
             }
@@ -133,8 +148,7 @@ impl App {
                 if matches!(self.form.focused_field(), FormField::Resume) {
                     self.toggle_resume();
                 } else {
-                    self.form.type_char(' ');
-                    self.form.clear_message();
+                    self.type_form_char(' ');
                 }
                 AppAction::None
             }
@@ -144,17 +158,14 @@ impl App {
                     self.progress = Some(ProgressState::new(&cfg));
                     self.summary = None;
                     self.failure = None;
+                    self.quit_after_download = false;
                     self.form.clear_message();
                     AppAction::Start(cfg)
                 }
-                Err(e) => {
-                    self.form.set_error(format!("{e:#}"));
-                    AppAction::None
-                }
+                Err(_) => AppAction::None,
             },
             KeyCode::Char(c) => {
-                self.form.type_char(c);
-                self.form.clear_message();
+                self.type_form_char(c);
                 AppAction::None
             }
             _ => AppAction::None,
@@ -164,10 +175,7 @@ impl App {
     fn on_key_downloading(&mut self, key: KeyEvent) -> AppAction {
         match key.code {
             KeyCode::Char('c') | KeyCode::Esc => AppAction::CancelDownload,
-            KeyCode::Char('q') => {
-                self.should_quit = true;
-                AppAction::Quit
-            }
+            KeyCode::Char('q') => AppAction::CancelAndQuit,
             _ => AppAction::None,
         }
     }
@@ -245,13 +253,25 @@ impl App {
             } => {
                 if let Some(progress) = self.progress.as_mut() {
                     progress.connections = strategy.clone();
+                    let segments = if segments == 0 {
+                        "unknown segments".to_string()
+                    } else {
+                        format!("{segments} segments")
+                    };
                     progress.mode = format!(
-                        "{} tuned ({} workers, {} segments, ~{:.1} MiB/segment)",
+                        "{} tuned ({} workers, {}, ~{}/segment)",
                         strategy,
                         workers,
                         segments,
-                        (segment_size as f64 / (1024.0 * 1024.0)).max(0.1)
+                        format_bytes(segment_size)
                     );
+                }
+            }
+            DownloadEvent::ProgressReset => {
+                if let Some(progress) = self.progress.as_mut() {
+                    progress.downloaded = 0;
+                    progress.newly_transferred = 0;
+                    progress.started = std::time::Instant::now();
                 }
             }
             DownloadEvent::Advanced(bytes) => {
@@ -265,20 +285,29 @@ impl App {
                     progress.downloaded = saved_bytes;
                     progress.phase = format!(
                         "Cancelled after saving {} verified bytes.",
-                        HumanBytes(saved_bytes)
+                        format_bytes(saved_bytes)
                     );
                 }
                 self.mark_cancelled(saved_bytes);
+                if self.quit_after_download {
+                    self.should_quit = true;
+                }
                 return true;
             }
             DownloadEvent::Completed(summary) => {
                 self.mode = UiMode::Done;
                 self.summary = Some(summary);
+                if self.quit_after_download {
+                    self.should_quit = true;
+                }
                 return true;
             }
             DownloadEvent::Failed(err) => {
                 self.mode = UiMode::Failed;
                 self.failure = Some(err);
+                if self.quit_after_download {
+                    self.should_quit = true;
+                }
                 return true;
             }
         }
@@ -295,7 +324,7 @@ impl App {
         self.mode = UiMode::Failed;
         self.failure = Some(format!(
             "Download cancelled. Saved {} verified bytes for resume.",
-            HumanBytes(saved_bytes)
+            format_bytes(saved_bytes)
         ));
     }
 
@@ -306,6 +335,14 @@ impl App {
         } else {
             "Resume enabled."
         });
+    }
+
+    fn type_form_char(&mut self, c: char) {
+        let field = self.form.focused_field();
+        match self.form.type_char(c) {
+            Ok(()) => self.form.clear_message(),
+            Err(err) => self.form.set_error(field, format!("{err:#}")),
+        }
     }
 }
 

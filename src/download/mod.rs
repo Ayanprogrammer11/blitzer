@@ -15,7 +15,7 @@ use chunk::RangeDownloadError;
 use http::{probe_remote, resolve_output_path};
 use manifest::build_chunks;
 use no_range::{NoRangeDownload, download_no_range_overlap};
-use parts::{compute_resume_offset, ensure_parent_dir, part_dir_for};
+use parts::{compute_resume_offset, ensure_parent_dir, part_dir_for, remove_state_dir_if_exists};
 use reqwest::Client;
 use std::{
     path::PathBuf,
@@ -34,6 +34,7 @@ use transfer::{ParallelDownload, download_parallel, download_single};
 use tuning::plan_transfer;
 
 const RATE_LIMIT_REQUEST_SPAN_BYTES: u64 = 128 * 1024 * 1024;
+const CONSERVATIVE_RANGE_WORKERS: usize = 4;
 
 #[derive(Clone)]
 pub struct CancelToken {
@@ -117,7 +118,6 @@ pub struct DownloadSummary {
     pub final_size: u64,
     pub newly_transferred: u64,
     pub elapsed: Duration,
-    pub avg_mib_per_sec: f64,
     pub used_parallel: bool,
 }
 
@@ -136,6 +136,7 @@ pub enum DownloadEvent {
         segments: usize,
         segment_size: u64,
     },
+    ProgressReset,
     Advanced(u64),
     Cancelled {
         saved_bytes: u64,
@@ -144,6 +145,7 @@ pub enum DownloadEvent {
     Failed(String),
 }
 
+#[cfg(test)]
 pub async fn run_download(
     cfg: DownloadConfig,
     tx: mpsc::UnboundedSender<DownloadEvent>,
@@ -216,13 +218,10 @@ pub async fn run_download_with_cancel(
                         saved_bytes: cancelled.saved_bytes(),
                     });
                     return Ok(());
-                } else if range_error_is_rate_limited(&err) {
-                    let _ = tx.send(DownloadEvent::Phase(format!(
-                        "Parallel range download was rate limited ({err:#}); retrying with one range worker."
-                    )));
+                } else if range_error_requires_lower_concurrency(&err) {
                     if let Some(delay) = range_error_retry_after(&err) {
                         let _ = tx.send(DownloadEvent::Phase(format!(
-                            "Waiting {}s for the server rate limit to cool down...",
+                            "Waiting {}s before lowering range concurrency...",
                             delay.as_secs()
                         )));
                         tokio::select! {
@@ -240,16 +239,19 @@ pub async fn run_download_with_cancel(
                             _ = sleep(delay) => {}
                         }
                     }
-                    let retry = ParallelDownload {
-                        worker_limit: Some(1),
-                        max_request_bytes: Some(RATE_LIMIT_REQUEST_SPAN_BYTES),
-                        retry_rate_limits: true,
-                        no_resume: false,
-                        ..parallel
-                    };
-                    let bytes = match download_parallel(retry)
-                        .await
-                        .context("single-worker range retry failed after rate limit")
+
+                    let initial_workers = plan_transfer(total, cfg.connections).workers;
+                    let limits = reduced_worker_limits(initial_workers);
+                    if limits.is_empty() {
+                        return Err(err).context("range request rejected at minimum concurrency");
+                    }
+                    let bytes = match retry_with_lower_range_concurrency(
+                        parallel,
+                        err,
+                        &limits,
+                        tx.clone(),
+                    )
+                    .await
                     {
                         Ok(bytes) => bytes,
                         Err(err) if download_cancelled(&err).is_some() => {
@@ -264,6 +266,7 @@ pub async fn run_download_with_cancel(
                     bytes
                 } else if range_error_can_retry_without_ranges(&err) {
                     cleanup_range_parts(&output).await;
+                    let _ = tx.send(DownloadEvent::ProgressReset);
                     let _ = tx.send(DownloadEvent::Phase(format!(
                         "Parallel range download failed ({err:#}); retrying without trusted ranges."
                     )));
@@ -320,15 +323,11 @@ pub async fn run_download_with_cancel(
         .await
         .with_context(|| format!("failed to read output metadata: {}", output.display()))?
         .len();
-    let avg_mib_per_sec =
-        (transferred_new as f64 / elapsed.as_secs_f64().max(0.001)) / (1024.0 * 1024.0);
-
     let _ = tx.send(DownloadEvent::Completed(DownloadSummary {
         output,
         final_size,
         newly_transferred: transferred_new,
         elapsed,
-        avg_mib_per_sec,
         used_parallel,
     }));
     Ok(())
@@ -336,7 +335,7 @@ pub async fn run_download_with_cancel(
 
 async fn cleanup_range_parts(output: &std::path::Path) {
     if let Ok(part_dir) = part_dir_for(output) {
-        let _ = fs::remove_dir_all(part_dir).await;
+        let _ = remove_state_dir_if_exists(&part_dir).await;
     }
 }
 
@@ -369,7 +368,7 @@ async fn download_without_ranges(
         }
         crate::config::NoRangeStrategy::Overlap { .. } => {
             let _ = tx.send(DownloadEvent::Phase(format!(
-                "Server has no byte ranges; trying {} speculative parallel streams.",
+                "Server has no byte ranges; trying {} speculative strategy.",
                 cfg.no_range_strategy.label()
             )));
             match download_no_range_overlap(NoRangeDownload {
@@ -390,6 +389,7 @@ async fn download_without_ranges(
                     if download_cancelled(&err).is_some() {
                         return Err(err);
                     }
+                    let _ = tx.send(DownloadEvent::ProgressReset);
                     let _ = tx.send(DownloadEvent::Phase(format!(
                         "No-range overlap proof failed ({err:#}); falling back to single stream."
                     )));
@@ -400,9 +400,18 @@ async fn download_without_ranges(
     }
 }
 
-fn range_error_is_rate_limited(err: &anyhow::Error) -> bool {
+fn range_error_requires_lower_concurrency(err: &anyhow::Error) -> bool {
     range_error(err)
-        .map(RangeDownloadError::is_rate_limited)
+        .and_then(RangeDownloadError::status_code)
+        .map(|status| {
+            matches!(
+                status,
+                reqwest::StatusCode::FORBIDDEN
+                    | reqwest::StatusCode::TOO_MANY_REQUESTS
+                    | reqwest::StatusCode::BAD_GATEWAY
+                    | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -424,4 +433,49 @@ fn range_error(err: &anyhow::Error) -> Option<&RangeDownloadError> {
 pub(super) fn download_cancelled(err: &anyhow::Error) -> Option<&DownloadCancelled> {
     err.chain()
         .find_map(|cause| cause.downcast_ref::<DownloadCancelled>())
+}
+
+fn reduced_worker_limits(initial_workers: usize) -> Vec<usize> {
+    let mut limits = Vec::with_capacity(2);
+    if initial_workers > CONSERVATIVE_RANGE_WORKERS {
+        limits.push(CONSERVATIVE_RANGE_WORKERS);
+    }
+    if initial_workers > 1 {
+        limits.push(1);
+    }
+    limits
+}
+
+async fn retry_with_lower_range_concurrency(
+    parallel: ParallelDownload<'_>,
+    initial_error: anyhow::Error,
+    limits: &[usize],
+    tx: mpsc::UnboundedSender<DownloadEvent>,
+) -> Result<u64> {
+    let mut last_error = initial_error;
+    for (index, &limit) in limits.iter().enumerate() {
+        let _ = tx.send(DownloadEvent::Phase(format!(
+            "Server rejected higher range concurrency ({last_error:#}); retrying with {limit} worker{}.",
+            if limit == 1 { "" } else { "s" }
+        )));
+        let retry = ParallelDownload {
+            worker_limit: Some(limit),
+            max_request_bytes: (limit == 1).then_some(RATE_LIMIT_REQUEST_SPAN_BYTES),
+            retry_rate_limits: true,
+            no_resume: false,
+            ..parallel.clone()
+        };
+        match download_parallel(retry).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(err)
+                if download_cancelled(&err).is_none()
+                    && range_error_requires_lower_concurrency(&err)
+                    && index + 1 < limits.len() =>
+            {
+                last_error = err;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_error)
 }

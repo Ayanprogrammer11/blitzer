@@ -21,15 +21,11 @@ pub(super) async fn prepare_part_dir(
     no_resume: bool,
     tx: mpsc::UnboundedSender<DownloadEvent>,
 ) -> Result<()> {
-    if no_resume && path_exists(part_dir).await? {
-        fs::remove_dir_all(part_dir)
-            .await
-            .with_context(|| format!("failed to remove {}", part_dir.display()))?;
+    if no_resume {
+        remove_state_dir_if_exists(part_dir).await?;
     }
 
-    fs::create_dir_all(part_dir)
-        .await
-        .with_context(|| format!("failed to create {}", part_dir.display()))?;
+    ensure_state_dir(part_dir).await?;
 
     let mut reset_reason = None;
     if !no_resume {
@@ -56,12 +52,8 @@ pub(super) async fn prepare_part_dir(
 
     if let Some(reason) = reset_reason {
         let _ = tx.send(DownloadEvent::Phase(format!("{reason} Starting fresh.")));
-        fs::remove_dir_all(part_dir)
-            .await
-            .with_context(|| format!("failed to reset {}", part_dir.display()))?;
-        fs::create_dir_all(part_dir)
-            .await
-            .with_context(|| format!("failed to recreate {}", part_dir.display()))?;
+        remove_state_dir_if_exists(part_dir).await?;
+        ensure_state_dir(part_dir).await?;
     }
 
     write_resume_manifest(part_dir, expected).await
@@ -187,6 +179,48 @@ pub(super) async fn remove_file_if_exists(path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("failed removing {}", path.display())),
+    }
+}
+
+pub(super) async fn ensure_state_dir(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path).await {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!(
+                "refusing to use symlinked state directory {}",
+                path.display()
+            )
+        }
+        Ok(meta) if !meta.is_dir() => {
+            bail!(
+                "state path exists but is not a directory: {}",
+                path.display()
+            )
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => fs::create_dir_all(path)
+            .await
+            .with_context(|| format!("failed to create {}", path.display())),
+        Err(e) => Err(e).with_context(|| format!("failed stat {}", path.display())),
+    }
+}
+
+pub(super) async fn remove_state_dir_if_exists(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path).await {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!(
+                "refusing to remove symlinked state directory {}",
+                path.display()
+            )
+        }
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path)
+            .await
+            .with_context(|| format!("failed to remove {}", path.display())),
+        Ok(_) => bail!(
+            "state path exists but is not a directory: {}",
+            path.display()
+        ),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("failed stat {}", path.display())),
     }
 }
 

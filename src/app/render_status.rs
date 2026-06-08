@@ -1,5 +1,5 @@
 use super::App;
-use indicatif::HumanBytes;
+use crate::format::{format_bytes, format_rate};
 use ratatui::{
     layout::{Constraint, Layout},
     prelude::{Color, Modifier, Style},
@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 impl App {
-    pub(super) fn render_downloading(&self, frame: &mut ratatui::Frame<'_>) {
+    pub(super) fn render_downloading(&mut self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
         let block = Block::default()
             .borders(Borders::ALL)
@@ -58,9 +58,9 @@ impl App {
                     progress.no_resume
                 )),
                 Line::from(format!(
-                    "Downloaded: {}  Rate: {:.2} MiB/s",
-                    HumanBytes(progress.downloaded),
-                    current_rate / (1024.0 * 1024.0)
+                    "Downloaded: {}  Rate: {}",
+                    format_bytes(progress.downloaded),
+                    format_rate(current_rate)
                 )),
             ];
             frame.render_widget(Paragraph::new(info).wrap(Wrap { trim: true }), chunks[0]);
@@ -77,29 +77,29 @@ impl App {
                     .ratio(ratio)
                     .label(format!(
                         "{} / {} ({:.1}%)",
-                        HumanBytes(progress.downloaded),
-                        HumanBytes(total),
+                        format_bytes(progress.downloaded),
+                        format_bytes(total),
                         ratio * 100.0
                     ));
                 frame.render_widget(gauge, chunks[1]);
             } else {
                 let unknown = Paragraph::new(format!(
                     "Progress: {} downloaded (server did not provide content length)",
-                    HumanBytes(progress.downloaded)
+                    format_bytes(progress.downloaded)
                 ))
                 .block(Block::default().borders(Borders::ALL).title("Progress"));
                 frame.render_widget(unknown, chunks[1]);
             }
         }
 
-        let log_text = Paragraph::new("Download is active. Press 'c' to cancel or 'q' to quit.")
-            .style(Style::default().fg(Color::Yellow))
-            .wrap(Wrap { trim: true });
+        let log_text =
+            Paragraph::new("Download active. c/Esc: cancel and review  q/Ctrl+C: cancel and quit")
+                .style(Style::default().fg(Color::Yellow))
+                .wrap(Wrap { trim: true });
         frame.render_widget(log_text, chunks[2]);
 
-        let footer =
-            Paragraph::new("Ctrl+C works too. Quitting while active aborts the download task.")
-                .style(Style::default().fg(Color::DarkGray));
+        let footer = Paragraph::new("Cancelling flushes verified part files for resume.")
+            .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(footer, chunks[3]);
     }
 
@@ -124,14 +124,16 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(format!("Saved to: {}", summary.output.display())),
-                Line::from(format!("Final size: {}", HumanBytes(summary.final_size))),
+                Line::from(format!("Final size: {}", format_bytes(summary.final_size))),
                 Line::from(format!(
                     "Newly transferred this run: {}",
-                    HumanBytes(summary.newly_transferred)
+                    format_bytes(summary.newly_transferred)
                 )),
                 Line::from(format!(
-                    "Average speed: {:.2} MiB/s",
-                    summary.avg_mib_per_sec
+                    "Average speed: {}",
+                    format_rate(
+                        summary.newly_transferred as f64 / summary.elapsed.as_secs_f64().max(0.001)
+                    )
                 )),
                 Line::from(format!("Elapsed: {:.2}s", summary.elapsed.as_secs_f64())),
                 Line::from(format!(

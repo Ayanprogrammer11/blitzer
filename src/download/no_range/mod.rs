@@ -7,15 +7,18 @@ mod tests;
 use super::{
     CancelToken, DownloadEvent,
     http::RequestHeaders,
-    parts::{ensure_parent_dir, path_exists, remove_file_if_exists},
+    parts::{
+        ensure_parent_dir, ensure_state_dir, path_exists, remove_file_if_exists,
+        remove_state_dir_if_exists,
+    },
 };
-use crate::config::NoRangeStrategy;
+use crate::{config::NoRangeStrategy, format::format_bytes};
 use anyhow::{Context, Result, bail};
 use fetch::{FetchPlan, fetch_segments};
 use merge::merge_overlap_segments;
 use reqwest::{Client, Url};
 use std::path::{Path, PathBuf};
-use tokio::{fs, sync::mpsc};
+use tokio::sync::mpsc;
 
 const PAYLOAD_BYTES: u64 = 1024 * 1024;
 
@@ -60,19 +63,15 @@ pub(super) async fn download_no_range_overlap(plan: NoRangeDownload<'_>) -> Resu
 
     let part_dir = no_range_part_dir_for(output)?;
     if path_exists(&part_dir).await? {
-        fs::remove_dir_all(&part_dir)
-            .await
-            .with_context(|| format!("failed to reset {}", part_dir.display()))?;
+        remove_state_dir_if_exists(&part_dir).await?;
     }
-    fs::create_dir_all(&part_dir)
-        .await
-        .with_context(|| format!("failed to create {}", part_dir.display()))?;
+    ensure_state_dir(&part_dir).await?;
     ensure_parent_dir(output).await?;
 
     let _ = tx.send(DownloadEvent::Phase(format!(
         "No-range overlap strategy: {workers} workers, {} payload, {} overlap",
-        human_mib(PAYLOAD_BYTES),
-        human_mib(overlap_bytes)
+        format_bytes(PAYLOAD_BYTES),
+        format_bytes(overlap_bytes)
     )));
     let _ = tx.send(DownloadEvent::PlanSelected {
         strategy: "no-range overlap".to_string(),
@@ -113,13 +112,11 @@ pub(super) async fn download_no_range_overlap(plan: NoRangeDownload<'_>) -> Resu
 
     match result {
         Ok(final_size) => {
-            fs::remove_dir_all(&part_dir)
-                .await
-                .with_context(|| format!("failed to cleanup {}", part_dir.display()))?;
+            remove_state_dir_if_exists(&part_dir).await?;
             Ok(final_size)
         }
         Err(err) => {
-            let _ = fs::remove_dir_all(&part_dir).await;
+            let _ = remove_state_dir_if_exists(&part_dir).await;
             let _ = remove_file_if_exists(&temp_output_path(output)).await;
             Err(err)
         }
@@ -151,8 +148,4 @@ fn temp_output_path(output: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(format!(".{file}.blitzer.tmp"))
-}
-
-fn human_mib(bytes: u64) -> String {
-    format!("{:.2} MiB", bytes as f64 / (1024.0 * 1024.0))
 }

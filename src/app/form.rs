@@ -1,11 +1,10 @@
 use crate::config::{
-    DownloadConfig, MAX_RETRIES, MAX_TIMEOUT, MIN_TIMEOUT, default_connection_input,
-    default_no_range_workers, default_overlap_bytes, parse_connection_strategy,
-    parse_no_range_strategy,
+    DownloadConfig, MAX_CONNECTIONS, MAX_OUTPUT_CHARS, MAX_RETRIES, MAX_TIMEOUT, MAX_URL_BYTES,
+    default_connection_input, default_no_range_workers, default_overlap_bytes,
+    parse_connection_strategy, parse_http_url, parse_no_range_strategy, parse_output_path,
+    parse_retries, parse_timeout_secs,
 };
-use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
-use url::Url;
+use anyhow::{Result, bail};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FormField {
@@ -36,6 +35,7 @@ pub(super) struct FormState {
     pub(super) no_resume: bool,
     pub(super) message: String,
     pub(super) error: bool,
+    pub(super) invalid_field: Option<FormField>,
     url_cursor: usize,
     output_cursor: usize,
     connections_cursor: usize,
@@ -62,6 +62,7 @@ impl Default for FormState {
             focused: 0,
             message: "Enter details, then press Enter to start.".to_string(),
             error: false,
+            invalid_field: None,
         }
     }
 }
@@ -82,16 +83,20 @@ impl FormState {
     pub(super) fn clear_message(&mut self) {
         self.message.clear();
         self.error = false;
+        self.invalid_field = None;
     }
 
-    pub(super) fn set_error(&mut self, message: impl Into<String>) {
+    pub(super) fn set_error(&mut self, field: FormField, message: impl Into<String>) {
         self.message = message.into();
         self.error = true;
+        self.invalid_field = Some(field);
+        self.set_focus_field(field);
     }
 
     pub(super) fn set_info(&mut self, message: impl Into<String>) {
         self.message = message.into();
         self.error = false;
+        self.invalid_field = None;
     }
 
     pub(super) fn backspace(&mut self) {
@@ -106,17 +111,22 @@ impl FormState {
         }
     }
 
-    pub(super) fn type_char(&mut self, c: char) {
-        if let Some((value, cursor, digits_only)) = self.focused_input_mut() {
-            if digits_only && !c.is_ascii_digit() {
-                return;
-            }
+    pub(super) fn type_char(&mut self, c: char) -> Result<()> {
+        let field = self.focused_field();
+        if matches!(field, FormField::Resume) && c == ' ' {
+            self.no_resume = !self.no_resume;
+            return Ok(());
+        }
+
+        if let Some((value, cursor, _digits_only)) = self.focused_input_mut() {
             let idx = char_to_byte_index(value, *cursor);
+            let mut candidate = value.clone();
+            candidate.insert(idx, c);
+            validate_input_shape(field, &candidate)?;
             value.insert(idx, c);
             *cursor += 1;
-        } else if matches!(self.focused_field(), FormField::Resume) && c == ' ' {
-            self.no_resume = !self.no_resume;
         }
+        Ok(())
     }
 
     pub(super) fn delete(&mut self) {
@@ -128,6 +138,13 @@ impl FormState {
             let start = char_to_byte_index(value, *cursor);
             let end = char_to_byte_index(value, *cursor + 1);
             value.replace_range(start..end, "");
+        }
+    }
+
+    pub(super) fn clear_focused_input(&mut self) {
+        if let Some((value, cursor, _digits_only)) = self.focused_input_mut() {
+            value.clear();
+            *cursor = 0;
         }
     }
 
@@ -197,28 +214,41 @@ impl FormState {
         }
     }
 
-    pub(super) fn build_config(&self) -> Result<DownloadConfig> {
-        let url = Url::parse(self.url.trim()).context("URL is invalid")?;
+    pub(super) fn validate_field(&self, field: FormField) -> Result<()> {
+        match field {
+            FormField::Url => parse_http_url(&self.url).map(|_| ()),
+            FormField::Output => parse_output_path(&self.output).map(|_| ()),
+            FormField::Connections => parse_connection_strategy(&self.connections).map(|_| ()),
+            FormField::Retries => parse_retries(&self.retries).map(|_| ()),
+            FormField::Timeout => parse_timeout_secs(&self.timeout_secs).map(|_| ()),
+            FormField::Resume => Ok(()),
+        }
+    }
+
+    pub(super) fn validate_focused(&mut self) -> bool {
+        let field = self.focused_field();
+        match self.validate_field(field) {
+            Ok(()) => true,
+            Err(err) => {
+                self.set_error(field, format!("{err:#}"));
+                false
+            }
+        }
+    }
+
+    pub(super) fn build_config(&mut self) -> Result<DownloadConfig> {
+        for field in FORM_FIELDS {
+            if let Err(err) = self.validate_field(field) {
+                self.set_error(field, format!("{err:#}"));
+                return Err(err);
+            }
+        }
+
+        let url = parse_http_url(&self.url)?;
         let connections = parse_connection_strategy(&self.connections)?;
-        let retries = parse_usize(&self.retries, "Retries")?;
-        let timeout_secs = parse_u64(&self.timeout_secs, "Timeout")?;
-
-        if retries > MAX_RETRIES {
-            bail!("Retries must be <= {}", MAX_RETRIES);
-        }
-        if !(MIN_TIMEOUT..=MAX_TIMEOUT).contains(&timeout_secs) {
-            bail!(
-                "Timeout must be in range {}..={} seconds",
-                MIN_TIMEOUT,
-                MAX_TIMEOUT
-            );
-        }
-
-        let output = if self.output.trim().is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(self.output.trim()))
-        };
+        let retries = parse_retries(&self.retries)?;
+        let timeout_secs = parse_timeout_secs(&self.timeout_secs)?;
+        let output = parse_output_path(&self.output)?;
 
         Ok(DownloadConfig {
             url,
@@ -256,14 +286,98 @@ fn char_to_byte_index(s: &str, char_index: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-fn parse_usize(raw: &str, label: &str) -> Result<usize> {
-    raw.trim()
-        .parse::<usize>()
-        .with_context(|| format!("{label} must be a valid integer"))
+fn validate_input_shape(field: FormField, candidate: &str) -> Result<()> {
+    match field {
+        FormField::Url => {
+            if candidate.len() > MAX_URL_BYTES {
+                bail!("URL is too long (maximum {MAX_URL_BYTES} bytes)");
+            }
+            if candidate.chars().any(char::is_whitespace) {
+                bail!("URL cannot contain whitespace");
+            }
+        }
+        FormField::Output => {
+            if candidate.chars().count() > MAX_OUTPUT_CHARS {
+                bail!("Output path is too long (maximum {MAX_OUTPUT_CHARS} characters)");
+            }
+            if candidate.chars().any(char::is_control) {
+                bail!("Output path cannot contain control characters");
+            }
+        }
+        FormField::Connections => {
+            let lower = candidate.to_ascii_lowercase();
+            let is_auto_prefix = "auto".starts_with(&lower);
+            let is_number = candidate.chars().all(|c| c.is_ascii_digit())
+                && candidate
+                    .parse::<usize>()
+                    .map(|value| value <= MAX_CONNECTIONS)
+                    .unwrap_or(candidate.is_empty());
+            if !is_auto_prefix && !is_number {
+                bail!("Connections accepts only 'auto' or 1..={MAX_CONNECTIONS}");
+            }
+        }
+        FormField::Retries => validate_bounded_number(candidate, "Retries", MAX_RETRIES as u64)?,
+        FormField::Timeout => validate_bounded_number(candidate, "Timeout", MAX_TIMEOUT)?,
+        FormField::Resume => {}
+    }
+    Ok(())
 }
 
-fn parse_u64(raw: &str, label: &str) -> Result<u64> {
-    raw.trim()
-        .parse::<u64>()
-        .with_context(|| format!("{label} must be a valid integer"))
+fn validate_bounded_number(candidate: &str, label: &str, max: u64) -> Result<()> {
+    if !candidate.chars().all(|c| c.is_ascii_digit()) {
+        bail!("{label} accepts digits only");
+    }
+    if !candidate.is_empty() && candidate.parse::<u64>().map_or(true, |value| value > max) {
+        bail!("{label} must be <= {max}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_connection_value_cannot_leave_field_or_start() {
+        let mut form = FormState {
+            url: "https://example.com/file.bin".to_string(),
+            ..FormState::default()
+        };
+        form.set_focus_field(FormField::Connections);
+        form.connections = "a".to_string();
+        form.connections_cursor = 1;
+
+        assert!(!form.validate_focused());
+        assert_eq!(form.focused_field(), FormField::Connections);
+        assert_eq!(form.invalid_field, Some(FormField::Connections));
+        assert!(form.build_config().is_err());
+    }
+
+    #[test]
+    fn field_input_rejects_invalid_characters_and_bounds() {
+        let mut form = FormState::default();
+        form.set_focus_field(FormField::Url);
+        assert!(form.type_char(' ').is_err());
+
+        form.set_focus_field(FormField::Output);
+        assert!(form.type_char('\n').is_err());
+
+        form.set_focus_field(FormField::Connections);
+        assert!(form.type_char('z').is_err());
+
+        form.set_focus_field(FormField::Retries);
+        form.retries.clear();
+        form.retries_cursor = 0;
+        assert!(form.type_char('x').is_err());
+        assert!(form.type_char('2').is_ok());
+        assert!(form.type_char('1').is_err());
+
+        form.set_focus_field(FormField::Timeout);
+        form.timeout_secs.clear();
+        form.timeout_cursor = 0;
+        for c in "300".chars() {
+            assert!(form.type_char(c).is_ok());
+        }
+        assert!(form.type_char('1').is_err());
+    }
 }

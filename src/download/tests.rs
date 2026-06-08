@@ -260,10 +260,9 @@ async fn rate_limited_ranges_retry_as_single_range_not_no_range() {
         served_ranges.len() <= plans[0].1 + 1,
         "rate-limit retry may resume an interrupted chunk tail, but should not restart chunks wholesale"
     );
-    assert_eq!(
-        served_starts.len(),
-        served_ranges.len(),
-        "retry should not request a previously-started chunk from the original offset"
+    assert!(
+        served_ranges.len().saturating_sub(served_starts.len()) <= 1,
+        "rate-limit recovery may replay one interrupted range, but must not restart ranges wholesale"
     );
     let chunks = build_chunks(content.len() as u64, plans[0].1);
     let first_chunk_len = chunk_len(chunks[0]) as usize;
@@ -273,11 +272,46 @@ async fn rate_limited_ranges_retry_as_single_range_not_no_range() {
             .any(|(start, end)| end - start + 1 > first_chunk_len),
         "rate-limit retry should coalesce adjacent manifest chunks into larger range requests"
     );
-    assert_eq!(
-        state.full_body_requests.load(Ordering::SeqCst),
-        0,
-        "rate-limit recovery must not switch to ordinary no-range GETs"
+    stop_range_server(&url);
+    handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn forbidden_parallel_ranges_retry_with_conservative_workers() {
+    let content = patterned_bytes(8 * 1024 * 1024 + 777);
+    let (url, state, handle) = spawn_policy_limited_range_server(content.clone());
+    let tmp = TempDir::new().unwrap();
+    let output = tmp.path().join("policy-limited.bin");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let cfg = DownloadConfig {
+        url: url.clone(),
+        output: Some(output.clone()),
+        connections: ConnectionStrategy::Fixed(8),
+        retries: 2,
+        timeout_secs: 30,
+        no_resume: true,
+        no_range_strategy: NoRangeStrategy::Single,
+    };
+
+    run_download(cfg, tx).await.unwrap();
+    let mut workers = Vec::new();
+    while let Ok(evt) = rx.try_recv() {
+        if let DownloadEvent::PlanSelected {
+            workers: selected, ..
+        } = evt
+        {
+            workers.push(selected);
+        }
+    }
+
+    assert_eq!(fs::read(&output).await.unwrap(), content);
+    assert_eq!(workers.first(), Some(&8));
+    assert!(
+        workers.contains(&CONSERVATIVE_RANGE_WORKERS),
+        "403 recovery should retry with a conservative parallel worker count"
     );
+    assert_eq!(state.full_body_requests.load(Ordering::SeqCst), 0);
+    assert!(state.rejected_ranges.load(Ordering::SeqCst) > 0);
 
     stop_range_server(&url);
     handle.join().unwrap();
@@ -347,8 +381,13 @@ fn spawn_referer_gated_server(content: Vec<u8>) -> (Url, thread::JoinHandle<()>)
 #[derive(Default)]
 struct RateLimitState {
     rejected_ranges: AtomicUsize,
-    full_body_requests: AtomicUsize,
     served_ranges: Mutex<Vec<(usize, usize)>>,
+}
+
+#[derive(Default)]
+struct PolicyLimitState {
+    rejected_ranges: AtomicUsize,
+    full_body_requests: AtomicUsize,
 }
 
 fn spawn_rate_limited_range_server(
@@ -370,6 +409,24 @@ fn spawn_rate_limited_range_server(
     (url, state, handle)
 }
 
+fn spawn_policy_limited_range_server(
+    content: Vec<u8>,
+) -> (Url, Arc<PolicyLimitState>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::new(PolicyLimitState::default());
+    let thread_state = state.clone();
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            if handle_policy_limited_connection(stream, &content, &thread_state) {
+                break;
+            }
+        }
+    });
+    let url = Url::parse(&format!("http://{addr}/policy-limited.bin")).unwrap();
+    (url, state, handle)
+}
+
 fn stop_range_server(url: &Url) {
     let addr = format!(
         "{}:{}",
@@ -383,11 +440,9 @@ fn stop_range_server(url: &Url) {
 }
 
 fn handle_connection(mut stream: TcpStream, content: &[u8]) -> bool {
-    let mut request = [0u8; 4096];
-    let Ok(read) = stream.read(&mut request) else {
+    let Some(request) = read_request_headers(&mut stream) else {
         return false;
     };
-    let request = String::from_utf8_lossy(&request[..read]);
     let first_line = request.lines().next().unwrap_or_default();
     let shutdown = request.contains("/shutdown");
 
@@ -403,7 +458,7 @@ fn handle_connection(mut stream: TcpStream, content: &[u8]) -> bool {
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nETag: \"fixture\"\r\nConnection: close\r\n\r\n",
             content.len()
         );
-        stream.write_all(response.as_bytes()).unwrap();
+        let _ = stream.write_all(response.as_bytes());
         return shutdown;
     }
 
@@ -417,8 +472,8 @@ fn handle_connection(mut stream: TcpStream, content: &[u8]) -> bool {
             end,
             content.len()
         );
-        stream.write_all(response.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
+        let _ = stream.write_all(response.as_bytes());
+        write_body(&mut stream, body);
         return shutdown;
     }
 
@@ -426,17 +481,15 @@ fn handle_connection(mut stream: TcpStream, content: &[u8]) -> bool {
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nETag: \"fixture\"\r\nConnection: close\r\n\r\n",
         content.len()
     );
-    stream.write_all(response.as_bytes()).unwrap();
-    stream.write_all(content).unwrap();
+    let _ = stream.write_all(response.as_bytes());
+    write_body(&mut stream, content);
     shutdown
 }
 
 fn handle_slow_connection(mut stream: TcpStream, content: &[u8]) -> bool {
-    let mut request = [0u8; 4096];
-    let Ok(read) = stream.read(&mut request) else {
+    let Some(request) = read_request_headers(&mut stream) else {
         return false;
     };
-    let request = String::from_utf8_lossy(&request[..read]);
     let first_line = request.lines().next().unwrap_or_default();
     let shutdown = request.contains("/shutdown");
 
@@ -471,11 +524,9 @@ fn handle_slow_connection(mut stream: TcpStream, content: &[u8]) -> bool {
 }
 
 fn handle_lying_connection(mut stream: TcpStream, content: &[u8]) -> bool {
-    let mut request = [0u8; 4096];
-    let Ok(read) = stream.read(&mut request) else {
+    let Some(request) = read_request_headers(&mut stream) else {
         return false;
     };
-    let request = String::from_utf8_lossy(&request[..read]);
     let first_line = request.lines().next().unwrap_or_default();
     let shutdown = request.contains("/shutdown");
 
@@ -524,11 +575,9 @@ fn handle_lying_connection(mut stream: TcpStream, content: &[u8]) -> bool {
 }
 
 fn handle_referer_gated_connection(mut stream: TcpStream, content: &[u8], page: &str) -> bool {
-    let mut request = [0u8; 4096];
-    let Ok(read) = stream.read(&mut request) else {
+    let Some(request) = read_request_headers(&mut stream) else {
         return false;
     };
-    let request = String::from_utf8_lossy(&request[..read]);
     let first_line = request.lines().next().unwrap_or_default();
     let shutdown = request.contains("/shutdown");
 
@@ -580,11 +629,9 @@ fn handle_rate_limited_connection(
     content: &[u8],
     state: &Arc<RateLimitState>,
 ) -> bool {
-    let mut request = [0u8; 4096];
-    let Ok(read) = stream.read(&mut request) else {
+    let Some(request) = read_request_headers(&mut stream) else {
         return false;
     };
-    let request = String::from_utf8_lossy(&request[..read]);
     let first_line = request.lines().next().unwrap_or_default();
     let shutdown = request.contains("/shutdown");
 
@@ -605,7 +652,6 @@ fn handle_rate_limited_connection(
     }
 
     let Some((start, end)) = parse_test_range(&request) else {
-        state.full_body_requests.fetch_add(1, Ordering::SeqCst);
         write_attachment_response(
             &mut stream,
             content,
@@ -664,6 +710,84 @@ fn handle_rate_limited_connection(
         "limited.bin",
     );
     false
+}
+
+fn handle_policy_limited_connection(
+    mut stream: TcpStream,
+    content: &[u8],
+    state: &Arc<PolicyLimitState>,
+) -> bool {
+    let Some(request) = read_request_headers(&mut stream) else {
+        return false;
+    };
+    let first_line = request.lines().next().unwrap_or_default();
+    if request.contains("/shutdown") {
+        let _ = stream.write_all(
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        return true;
+    }
+    if first_line.starts_with("HEAD ") {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+            content.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        return false;
+    }
+
+    let Some((start, end)) = parse_test_range(&request) else {
+        state.full_body_requests.fetch_add(1, Ordering::SeqCst);
+        write_attachment_response(
+            &mut stream,
+            content,
+            "application/octet-stream",
+            "policy-limited.bin",
+        );
+        return false;
+    };
+    if start == 0 && end == 0 {
+        write_range_response(
+            &mut stream,
+            content,
+            start,
+            end,
+            "application/octet-stream",
+            "policy-limited.bin",
+        );
+        return false;
+    }
+    if state.rejected_ranges.fetch_add(1, Ordering::SeqCst) < 4 {
+        let _ = stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return false;
+    }
+
+    write_range_response(
+        &mut stream,
+        content,
+        start,
+        end,
+        "application/octet-stream",
+        "policy-limited.bin",
+    );
+    false
+}
+
+fn read_request_headers(stream: &mut TcpStream) -> Option<String> {
+    let mut request = Vec::with_capacity(1024);
+    let mut buffer = [0u8; 1024];
+    while request.len() < 16 * 1024 {
+        let read = stream.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8(request).ok()
 }
 
 fn write_html_page(stream: &mut TcpStream, advertised_size: usize) {

@@ -62,6 +62,7 @@ enum AppAction {
     None,
     Start(DownloadConfig),
     CancelDownload,
+    CancelAndQuit,
     Quit,
 }
 
@@ -72,6 +73,7 @@ struct App {
     summary: Option<DownloadSummary>,
     failure: Option<String>,
     should_quit: bool,
+    quit_after_download: bool,
     spinner_idx: usize,
 }
 
@@ -84,6 +86,7 @@ impl Default for App {
             summary: None,
             failure: None,
             should_quit: false,
+            quit_after_download: false,
             spinner_idx: 0,
         }
     }

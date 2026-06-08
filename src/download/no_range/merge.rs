@@ -58,18 +58,19 @@ pub(super) async fn merge_overlap_segments(
             break;
         }
 
+        if current.len < expected_overlap.len() as u64 {
+            bail!(
+                "no-range segment {} ended before verified overlap completed",
+                current.index
+            );
+        }
+
         let actual_overlap =
             read_segment_range(part_dir, current.index, 0, expected_overlap.len() as u64).await?;
         if actual_overlap != expected_overlap {
             bail!(
                 "no-range overlap mismatch between segments {} and {}; source is not stable",
                 previous.index,
-                current.index
-            );
-        }
-        if current.len < expected_overlap.len() as u64 {
-            bail!(
-                "no-range segment {} ended before verified overlap completed",
                 current.index
             );
         }
@@ -111,11 +112,9 @@ async fn read_segment_range(
         .await
         .with_context(|| format!("failed seeking {}", path.display()))?;
     let mut buf = vec![0; len as usize];
-    let read = file
-        .read(&mut buf)
+    file.read_exact(&mut buf)
         .await
-        .with_context(|| format!("failed reading {}", path.display()))?;
-    buf.truncate(read);
+        .with_context(|| format!("failed reading {} bytes from {}", len, path.display()))?;
     Ok(buf)
 }
 
